@@ -1,0 +1,166 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# icu HPKBUILD - 为鸿蒙交叉编译适配
+# -----------------------------------------------------------------------------
+pkgname=icu
+pkgver=73.2
+pkgver_tag=release-73-2
+pkgdesc="International Components for Unicode (ICU)"
+url="https://github.com/unicode-org/icu"
+archs=("arm64-v8a")
+license=("ICU License")
+depends=()
+makedepends=("make" "pkg-config")
+
+source="https://gitee.com/lycium_pkg_mirror/icu/repository/archive/${pkgver_tag}.zip"
+autounpack=true
+downloadpackage=true
+buildtools="configure"
+
+builddir=icu-${pkgver_tag}
+packagename=icu-${pkgver_tag}.zip
+
+# -----------------------------------------------------------------------------
+# prepare() - 宿主版编译 + 修补 config.sub
+# -----------------------------------------------------------------------------
+prepare() {
+    echo "[ICU] Preparing source..."
+    
+    # 自动重命名解压目录
+    if [ ! -d "$builddir" ]; then
+        local decoded_dir=$(ls -d icu* 2>/dev/null | grep -v "\.zip" | head -n 1)
+        if [ -n "$decoded_dir" ]; then
+            mv "$decoded_dir" "$builddir"
+        fi
+    fi
+    
+    # 关键修复：patch config.sub 让它识别 ohos
+    # 在 config.sub 中找到 -musl* 的位置，在其后追加 -ohos*
+    local config_sub="$builddir/icu4c/source/config.sub"
+    if [ -f "$config_sub" ]; then
+        if ! grep -q "ohos" "$config_sub"; then
+            echo "[ICU] Patching config.sub to recognize 'ohos'..."
+            sed -i 's/-musl\*/-musl* | -ohos*/g' "$config_sub"
+            # 同时处理 OS 识别部分
+            sed -i 's/-musleabi\*/-musleabi* | -ohos*/g' "$config_sub"
+            chmod +x "$config_sub"
+        fi
+    fi
+    
+    # 步骤 1：构建宿主机版本
+    if [ ! -f "$builddir/host-build/bin/genrb" ]; then
+        echo "[ICU] Building HOST version..."
+        mkdir -p "$builddir/host-build"
+        cd "$builddir/host-build" || return 1
+        
+        CXXFLAGS="-std=c++17 -DU_USING_ICU_NAMESPACE=0" \
+        ../icu4c/source/runConfigureICU Linux/gcc \
+            --disable-tests \
+            --disable-samples \
+            >> "$buildlog" 2>&1
+        
+        if [ $? -ne 0 ]; then
+            echo "[ICU] ERROR: HOST configure failed" >> "$buildlog"
+            return 1
+        fi
+        
+        make -j$(nproc) >> "$buildlog" 2>&1
+        if [ $? -ne 0 ]; then
+            echo "[ICU] ERROR: HOST build failed" >> "$buildlog"
+            return 1
+        fi
+        
+        cd "$OLDPWD"
+        echo "[ICU] HOST version built successfully."
+    fi
+    
+    # 步骤 2：为目标架构创建构建目录
+    mkdir -p "$builddir/$ARCH-build"
+    echo "[ICU] Prepare completed. ARCH=$ARCH" >> "$buildlog"
+}
+
+# ============================================================================
+# build() - 交叉编译
+# ============================================================================
+build() {
+    local build_dir="$builddir/$ARCH-build"
+    local host_dir="$(realpath $builddir/host-build)"
+    local install_dir="${LYCIUM_ROOT}/usr/${pkgname}/${ARCH}"
+    
+    echo "[ICU] Building for $ARCH..." | tee -a "$buildlog"
+    mkdir -p "$install_dir"
+    cd "$build_dir" || return 1
+    
+    local target="aarch64-linux-ohos"
+    local sysroot="$OHOS_SDK/native/sysroot"
+    
+    export CC="$OHOS_SDK/native/llvm/bin/clang --target=$target --sysroot=$sysroot"
+    export CXX="$OHOS_SDK/native/llvm/bin/clang++ --target=$target --sysroot=$sysroot"
+    export AR="$OHOS_SDK/native/llvm/bin/llvm-ar"
+    export RANLIB="$OHOS_SDK/native/llvm/bin/llvm-ranlib"
+    export CFLAGS="-fPIC -O2"
+    export CXXFLAGS="-std=c++17 -fPIC -O2 -DU_USING_ICU_NAMESPACE=0"
+    export LDFLAGS="--target=$target --sysroot=$sysroot"
+    
+    # 使用 aarch64-linux-gnu 作为 --host 欺骗 config.sub
+    # 实际编译器已经通过 CC/CXX 中的 --target=aarch64-linux-ohos 指向了正确的目标
+    ../icu4c/source/configure \
+        --host=aarch64-linux-gnu \
+        --with-cross-build="$host_dir" \
+        --prefix="$install_dir" \
+        --enable-static \
+        --disable-tests \
+        --disable-samples \
+        --disable-extras \
+        --with-data-packaging=archive \
+        >> "$buildlog" 2>&1
+    
+    local ret=$?
+    if [ $ret -ne 0 ]; then
+        echo "[ICU] ERROR: Cross-compile configure failed" >> "$buildlog"
+        cat config.log >> "$buildlog" 2>&1
+        return $ret
+    fi
+    
+    make -j$(nproc) >> "$buildlog" 2>&1
+    ret=$?
+    
+    cd "$OLDPWD"
+    unset CC CXX AR RANLIB CFLAGS CXXFLAGS LDFLAGS
+    return $ret
+}
+
+# ============================================================================
+# package()
+# ============================================================================
+package() {
+    local build_dir="$builddir/$ARCH-build"
+    local install_dir="${LYCIUM_ROOT}/usr/${pkgname}/${ARCH}"
+    
+    echo "[ICU] Installing to $install_dir..." >> "$buildlog"
+    cd "$build_dir" || return 1
+    
+    make install >> "$buildlog" 2>&1
+    local ret=$?
+    
+    # 验证关键产物
+    if [ ! -f "$install_dir/lib/libicuuc.so" ]; then
+        echo "[ICU] ERROR: libicuuc.so not found!" >> "$buildlog"
+        return 1
+    fi
+    
+    cd "$OLDPWD"
+    return $ret
+}
+
+# ============================================================================
+# check() & cleanbuild()
+# ============================================================================
+check() {
+    echo "[ICU] Check skipped for cross-compilation"
+    return 0
+}
+
+cleanbuild() {
+    rm -rf "$builddir"
+}

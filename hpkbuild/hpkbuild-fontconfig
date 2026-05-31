@@ -1,0 +1,194 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# fontconfig HPKBUILD - 为鸿蒙交叉编译适配 (TexLive 依赖项)
+# -----------------------------------------------------------------------------
+pkgname=fontconfig
+pkgver=2.14.2
+pkgdesc="Library for configuring and customizing font access"
+url="https://www.freedesktop.org/wiki/Software/fontconfig/"
+archs=("arm64-v8a")
+license=("MIT")
+
+# fontconfig 依赖 freetype2 和 expat
+depends=("freetype2" "expat")
+makedepends=("make" "pkg-config" "gperf")
+
+source="https://www.freedesktop.org/software/fontconfig/release/fontconfig-${pkgver}.tar.gz"
+autounpack=true
+downloadpackage=true
+buildtools="configure"
+
+builddir=fontconfig-${pkgver}
+packagename=fontconfig-${pkgver}.tar.gz
+
+# -----------------------------------------------------------------------------
+# prepare()
+# -----------------------------------------------------------------------------
+prepare() {
+    echo "[fontconfig] Preparing source..."
+    
+    if [ ! -d "$builddir" ]; then
+        local decoded_dir=$(ls -d fontconfig* 2>/dev/null | grep -v "\.tar" | head -n 1)
+        [ -n "$decoded_dir" ] && mv "$decoded_dir" "$builddir"
+    fi
+    
+    # patch config.sub 让它识别 ohos
+    for cs in "$builddir/config.sub" "$builddir/build-aux/config.sub"; do
+        if [ -f "$cs" ] && ! grep -q "ohos" "$cs"; then
+            echo "[fontconfig] Patching $cs..."
+            sed -i 's/-musl\*/-musl* | -ohos*/g' "$cs"
+            chmod +x "$cs"
+        fi
+    done
+    
+    mkdir -p "$builddir/build-$ARCH"
+    echo "[fontconfig] Prepare completed. ARCH=$ARCH" >> "$buildlog"
+}
+
+# ============================================================================
+# build()
+# ============================================================================
+build() {
+    local build_dir="$builddir/build-$ARCH"
+    local install_dir="${LYCIUM_ROOT}/usr/${pkgname}/${ARCH}"
+    
+    # 定义所有依赖库的路径
+    local freetype_dir="${LYCIUM_ROOT}/usr/freetype2/${ARCH}"
+    local expat_dir="${LYCIUM_ROOT}/usr/expat/${ARCH}"
+    local zlib_dir="${LYCIUM_ROOT}/usr/zlib/${ARCH}"
+    local libpng_dir="${LYCIUM_ROOT}/usr/libpng/${ARCH}"
+    local bzip2_dir="${LYCIUM_ROOT}/usr/bzip2/${ARCH}"
+    local brotli_dir="${LYCIUM_ROOT}/usr/brotli/${ARCH}" # 如果没有编译brotli，后面会自动忽略
+    
+    echo "[fontconfig] Building for $ARCH..." | tee -a "$buildlog"
+    mkdir -p "$install_dir"
+    cd "$build_dir" || return 1
+    
+    local target="aarch64-linux-ohos"
+    local sysroot="$OHOS_SDK/native/sysroot"
+    
+    # 1. 基础工具链设置
+    export CC="$OHOS_SDK/native/llvm/bin/clang --target=$target --sysroot=$sysroot"
+    export CXX="$OHOS_SDK/native/llvm/bin/clang++ --target=$target --sysroot=$sysroot"
+    export AR="$OHOS_SDK/native/llvm/bin/llvm-ar"
+    export RANLIB="$OHOS_SDK/native/llvm/bin/llvm-ranlib"
+    export STRIP="$OHOS_SDK/native/llvm/bin/llvm-strip"
+    
+    # 2. 构造 FREETYPE_CFLAGS (包含所有头文件路径)
+    local ft_cflags="-I$freetype_dir/include/freetype2 -I$freetype_dir/include"
+    ft_cflags="$ft_cflags -I$zlib_dir/include -I$libpng_dir/include -I$bzip2_dir/include"
+    
+    # 3. 构造 FREETYPE_LIBS (包含所有库文件路径和链接标志)
+    # 必须把 freetype 依赖的底层库全部写在这里，防止链接时报 undefined symbol
+    local ft_libs="-L$freetype_dir/lib -lfreetype -L$zlib_dir/lib -lz -L$libpng_dir/lib -lpng16 -L$bzip2_dir/lib -lbz2"
+    # 如果有 brotli 则加上
+    if [ -f "$brotli_dir/lib/libbrotlidec.a" ]; then
+        ft_libs="$ft_libs -L$brotli_dir/lib -lbrotlidec -lbrotlicommon"
+    fi
+
+    # 4. 构造 EXPAT 注入参数
+    local expat_cflags="-I$expat_dir/include"
+    local expat_libs="-L$expat_dir/lib -lexpat"
+
+    export CFLAGS="-fPIC -O2"
+    export LDFLAGS="--target=$target --sysroot=$sysroot"
+
+    # 5. 调用 configure，通过命令行变量强制注入，跳过 pkg-config 检查
+    ../configure \
+        --host=aarch64-linux-gnu \
+        --prefix="$install_dir" \
+        --enable-shared \
+        --enable-static \
+        --disable-docs \
+        --disable-cache-build \
+        --with-default-fonts=/system/fonts \
+        --with-cache-dir=/data/cache/fontconfig \
+        --with-arch=aarch64 \
+        FREETYPE_CFLAGS="$ft_cflags" \
+        FREETYPE_LIBS="$ft_libs" \
+        EXPAT_CFLAGS="$expat_cflags" \
+        EXPAT_LIBS="$expat_libs" \
+        >> "$buildlog" 2>&1
+    
+    local ret=$?
+    if [ $ret -ne 0 ]; then
+        echo "[fontconfig] ERROR: configure failed" >> "$buildlog"
+        cat config.log >> "$buildlog" 2>&1
+        return $ret
+    fi
+    
+    # 编译核心库，忽略可能报错的工具目录
+    make -j$(nproc) -C src >> "$buildlog" 2>&1
+    ret=$?
+    
+    cd "$OLDPWD"
+    unset CC CXX AR RANLIB STRIP CFLAGS LDFLAGS FREETYPE_CFLAGS FREETYPE_LIBS EXPAT_CFLAGS EXPAT_LIBS
+    return $ret
+}
+
+# ============================================================================
+# package()
+# ============================================================================
+package() {
+    local build_dir="$builddir/build-$ARCH"
+    local install_dir="${LYCIUM_ROOT}/usr/${pkgname}/${ARCH}"
+    
+    echo "[fontconfig] Installing to $install_dir..." >> "$buildlog"
+    cd "$build_dir" || return 1
+    
+    # 尝试完整安装
+    make install >> "$buildlog" 2>&1
+    
+    # 如果完整安装失败（fc-cache 等工具安装出错），手动安装核心文件
+    if [ ! -f "$install_dir/lib/libfontconfig.so" ] && \
+       [ ! -f "$install_dir/lib/libfontconfig.a" ]; then
+        echo "[fontconfig] Full install failed, performing manual install..." >> "$buildlog"
+        
+        # 安装库文件
+        mkdir -p "$install_dir/lib"
+        find "$build_dir/src/.libs" -name "libfontconfig*" 2>/dev/null | while read libfile; do
+            cp -d "$libfile" "$install_dir/lib/" 2>/dev/null
+        done
+        
+        # 安装头文件
+        mkdir -p "$install_dir/include/fontconfig"
+        cp "$builddir/fontconfig"/*.h "$install_dir/include/fontconfig/" 2>/dev/null
+        
+        # 安装 pkgconfig
+        mkdir -p "$install_dir/lib/pkgconfig"
+        if [ -f "$build_dir/fontconfig.pc" ]; then
+            cp "$build_dir/fontconfig.pc" "$install_dir/lib/pkgconfig/"
+        fi
+    fi
+    
+    cd "$OLDPWD"
+    
+    # 验证关键产物
+    if [ ! -f "$install_dir/lib/libfontconfig.so" ] && \
+       [ ! -f "$install_dir/lib/libfontconfig.a" ]; then
+        echo "[fontconfig] ERROR: No fontconfig libraries installed!" >> "$buildlog"
+        return 1
+    fi
+    
+    if [ ! -f "$install_dir/include/fontconfig/fontconfig.h" ]; then
+        echo "[fontconfig] WARNING: fontconfig.h may be missing" >> "$buildlog"
+    fi
+    
+    echo "[fontconfig] Installation completed." >> "$buildlog"
+    return 0
+}
+
+# ============================================================================
+# check()
+# ============================================================================
+check() {
+    echo "[fontconfig] Check skipped for cross-compilation"
+    return 0
+}
+
+# ============================================================================
+# cleanbuild()
+# ============================================================================
+cleanbuild() {
+    rm -rf "$builddir"
+}

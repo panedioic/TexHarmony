@@ -1,0 +1,187 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# graphite2 HPKBUILD - 为鸿蒙交叉编译适配 (TexLive 依赖项)
+# -----------------------------------------------------------------------------
+pkgname=graphite2
+pkgver=1.3.14
+pkgdesc="Graphite is a system that can be used to create smart fonts capable of displaying writing systems with various complex behaviors"
+url="https://github.com/silnrsi/graphite"
+archs=("arm64-v8a")
+license=("LGPL-2.1-or-later")
+depends=()
+makedepends=("cmake" "ninja")
+
+# 使用 GitHub Release 直接下载 tar.gz 压缩包
+source="https://github.com/silnrsi/graphite/releases/download/${pkgver}/graphite2-${pkgver}.tgz"
+autounpack=true
+downloadpackage=true
+buildtools="cmake"
+
+builddir=graphite2-${pkgver}
+packagename=graphite2-${pkgver}.tgz
+
+# -----------------------------------------------------------------------------
+# prepare()
+# -----------------------------------------------------------------------------
+prepare() {
+    echo "[graphite2] Preparing source..."
+    
+    # 自动重命名解压目录（兼容不同压缩包结构）
+    if [ ! -d "$builddir" ]; then
+        local decoded_dir=$(ls -d graphite2* 2>/dev/null | grep -v "\.tgz" | grep -v "\.zip" | head -n 1)
+        [ -n "$decoded_dir" ] && mv "$decoded_dir" "$builddir"
+    fi
+
+    # 同时创建动态库和静态库的构建目录
+    mkdir -p "$builddir/build-shared-$ARCH"
+    mkdir -p "$builddir/build-static-$ARCH"
+    
+    # 关键修复：graphite2 默认会编译 gr2fonttest 等可执行文件
+    # 这些工具在交叉编译时会因找不到目标平台的运行时库而失败
+    # 这里 patch CMakeLists.txt，跳过非必要的工具构建
+    local main_cmakelists="$builddir/CMakeLists.txt"
+    if [ -f "$main_cmakelists" ] && ! grep -q "GRAPHITE2_NO_TESTS_PATCHED" "$main_cmakelists"; then
+        echo "# GRAPHITE2_NO_TESTS_PATCHED" >> "$main_cmakelists"
+        # 让 tests 目录变为可选
+        sed -i 's/^add_subdirectory(tests)/if(GRAPHITE2_BUILD_TESTS)\n    add_subdirectory(tests)\nendif()/g' "$main_cmakelists" 2>/dev/null
+    fi
+    
+    echo "[graphite2] Prepare completed. ARCH=$ARCH" >> "$buildlog"
+}
+
+# -----------------------------------------------------------------------------
+# 共用 cmake 参数
+# -----------------------------------------------------------------------------
+_cmake_common_args() {
+    echo \
+        "-G" "Ninja" \
+        "-DCMAKE_TOOLCHAIN_FILE=$OHOS_SDK/native/build/cmake/ohos.toolchain.cmake" \
+        "-DOHOS_ARCH=$ARCH" \
+        "-DOHOS_PLATFORM=OHOS" \
+        "-DOHOS_STL=c++_shared" \
+        "-DCMAKE_BUILD_TYPE=Release" \
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON" \
+        "-DGRAPHITE2_NTRACING=ON" \
+        "-DGRAPHITE2_COMPARE_RENDERER=OFF" \
+        "-DGRAPHITE2_BUILD_TESTS=OFF" \
+        "-DBUILD_TESTING=OFF"
+}
+
+# ============================================================================
+# build() - 一次性编译动态库 + 静态库
+# ============================================================================
+build() {
+    local install_dir="${LYCIUM_ROOT}/usr/${pkgname}/${ARCH}"
+    local common_args=$(_cmake_common_args)
+    
+    mkdir -p "$install_dir"
+    
+    # ------- 第一轮：动态库 -------
+    echo "[graphite2] Building SHARED library..." | tee -a "$buildlog"
+    cd "$builddir/build-shared-$ARCH" || return 1
+    
+    cmake .. $common_args \
+        -DBUILD_SHARED_LIBS=ON \
+        -DCMAKE_INSTALL_PREFIX="$install_dir" \
+        >> "$buildlog" 2>&1
+    
+    if [ $? -ne 0 ]; then
+        echo "[graphite2] ERROR: SHARED CMake config failed" >> "$buildlog"
+        return 1
+    fi
+    
+    ninja -j$(nproc) graphite2 >> "$buildlog" 2>&1
+    if [ $? -ne 0 ]; then
+        echo "[graphite2] ERROR: SHARED build failed" >> "$buildlog"
+        return 1
+    fi
+    
+    cd "$OLDPWD"
+    
+    # ------- 第二轮：静态库 -------
+    echo "[graphite2] Building STATIC library..." | tee -a "$buildlog"
+    cd "$builddir/build-static-$ARCH" || return 1
+    
+    cmake .. $common_args \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_INSTALL_PREFIX="$install_dir" \
+        >> "$buildlog" 2>&1
+    
+    if [ $? -ne 0 ]; then
+        echo "[graphite2] ERROR: STATIC CMake config failed" >> "$buildlog"
+        return 1
+    fi
+    
+    ninja -j$(nproc) graphite2 >> "$buildlog" 2>&1
+    if [ $? -ne 0 ]; then
+        echo "[graphite2] ERROR: STATIC build failed" >> "$buildlog"
+        return 1
+    fi
+    
+    cd "$OLDPWD"
+    return 0
+}
+
+# ============================================================================
+# package() - 仅做安装与拷贝
+# ============================================================================
+package() {
+    local install_dir="${LYCIUM_ROOT}/usr/${pkgname}/${ARCH}"
+    
+    # 1. 安装动态库 + 头文件
+    echo "[graphite2] Installing SHARED library and headers..." >> "$buildlog"
+    cd "$builddir/build-shared-$ARCH" || return 1
+    
+    # 注意：完整的 ninja install 会尝试安装 gr2fonttest 等可执行文件
+    # 我们只安装 graphite2 库本体和头文件
+    ninja install >> "$buildlog" 2>&1
+    local ret=$?
+    cd "$OLDPWD"
+    
+    # 即使 install 报错（可能是 gr2fonttest 找不到），核心文件应该已经安装
+    # 通过验证关键产物来确定真正的成功状态
+    if [ ! -f "$install_dir/lib/libgraphite2.so" ] && \
+       [ ! -f "$install_dir/lib/libgraphite2.so.${pkgver%%.*}" ]; then
+        echo "[graphite2] ERROR: libgraphite2.so missing!" >> "$buildlog"
+        return 1
+    fi
+    
+    # 2. 拷贝静态库
+    local static_lib_file=""
+    for candidate in "$builddir/build-static-$ARCH/src/libgraphite2.a" \
+                     "$builddir/build-static-$ARCH/libgraphite2.a"; do
+        if [ -f "$candidate" ]; then
+            static_lib_file="$candidate"
+            break
+        fi
+    done
+    
+    if [ -n "$static_lib_file" ]; then
+        cp "$static_lib_file" "$install_dir/lib/"
+        echo "[graphite2] Static library installed at $install_dir/lib/libgraphite2.a" >> "$buildlog"
+    else
+        echo "[graphite2] WARNING: libgraphite2.a not found in static-build directory!" >> "$buildlog"
+    fi
+    
+    # 3. 验证头文件
+    if [ ! -f "$install_dir/include/graphite2/Font.h" ]; then
+        echo "[graphite2] WARNING: Headers may be missing" >> "$buildlog"
+    fi
+    
+    return 0
+}
+
+# ============================================================================
+# check()
+# ============================================================================
+check() {
+    echo "[graphite2] Check skipped for cross-compilation"
+    return 0
+}
+
+# ============================================================================
+# cleanbuild()
+# ============================================================================
+cleanbuild() {
+    rm -rf "$builddir"
+}

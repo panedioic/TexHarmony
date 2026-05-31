@@ -1,0 +1,71 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# expat HPKBUILD - 为鸿蒙交叉编译适配
+# -----------------------------------------------------------------------------
+pkgname=expat
+pkgver=2.6.2
+pkgdesc="Fast streaming XML parser written in C"
+url="https://github.com/libexpat/libexpat"
+archs=("arm64-v8a")
+license=("MIT")
+depends=()
+makedepends=("cmake" "ninja")
+
+source="https://github.com/libexpat/libexpat/releases/download/R_${pkgver//./_}/expat-${pkgver}.tar.gz"
+autounpack=true
+downloadpackage=true
+buildtools="cmake"
+
+builddir=expat-${pkgver}
+packagename=expat-${pkgver}.tar.gz
+
+prepare() {
+    if [ ! -d "$builddir" ]; then
+        local decoded_dir=$(ls -d expat* 2>/dev/null | grep -v "\.tar" | head -n 1)
+        [ -n "$decoded_dir" ] && mv "$decoded_dir" "$builddir"
+    fi
+    mkdir -p "$builddir/build-$ARCH"
+}
+
+build() {
+    local build_dir="$builddir/build-$ARCH"
+    local install_dir="${LYCIUM_ROOT}/usr/${pkgname}/${ARCH}"
+    
+    mkdir -p "$install_dir"
+    cd "$build_dir" || return 1
+    
+    cmake .. \
+        -G Ninja \
+        -DCMAKE_TOOLCHAIN_FILE="$OHOS_SDK/native/build/cmake/ohos.toolchain.cmake" \
+        -DOHOS_ARCH="$ARCH" \
+        -DOHOS_PLATFORM=OHOS \
+        -DOHOS_STL=c++_shared \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="$install_dir" \
+        -DBUILD_SHARED_LIBS=ON \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DEXPAT_BUILD_TESTS=OFF \
+        -DEXPAT_BUILD_TOOLS=OFF \
+        -DEXPAT_BUILD_EXAMPLES=OFF \
+        -DEXPAT_BUILD_DOCS=OFF \
+        >> "$buildlog" 2>&1
+    
+    if [ $? -ne 0 ]; then return 1; fi
+    
+    ninja -j$(nproc) >> "$buildlog" 2>&1
+    local ret=$?
+    cd "$OLDPWD"
+    return $ret
+}
+
+package() {
+    cd "$builddir/build-$ARCH" || return 1
+    ninja install >> "$buildlog" 2>&1
+    local ret=$?
+    cd "$OLDPWD"
+    return $ret
+}
+
+check() { return 0; }
+
+cleanbuild() { rm -rf "$builddir"; }

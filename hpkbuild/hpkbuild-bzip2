@@ -1,0 +1,116 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# bzip2 HPKBUILD - 为鸿蒙交叉编译适配
+# -----------------------------------------------------------------------------
+pkgname=bzip2
+pkgver=1.0.8
+pkgdesc="bzip2 is a freely available, patent free, high-quality data compressor."
+url="https://github.com/libarchive/bzip2"
+archs=("arm64-v8a")
+license=("bzip2-1.0.6")
+depends=()
+makedepends=("make")
+
+# 弃用 sourceware，改用 GitHub 权威镜像源的压缩包
+source="https://github.com/libarchive/bzip2/archive/refs/tags/bzip2-${pkgver}.tar.gz"
+autounpack=true
+downloadpackage=true
+buildtools="make"
+
+# GitHub 打包解压后的文件夹通常是 仓库名-标签名 (bzip2-bzip2-1.0.8)
+# 为了统一下面的逻辑，我们定义统一变量
+builddir=${pkgname}-${pkgver}
+packagename=${pkgname}-${pkgver}.tar.gz
+
+# -----------------------------------------------------------------------------
+# prepare()
+# -----------------------------------------------------------------------------
+prepare() {
+    echo "[bzip2] Preparing source..."
+    
+    # 自动重命名解压目录机制（兼容各种镜像包解压后的奇葩名字）
+    if [ ! -d "$builddir" ]; then
+        local decoded_dir=$(ls -d bzip2* | grep -v "\.tar\.gz" | grep -v "\.zip" | head -n 1)
+        if [ -n "$decoded_dir" ]; then
+            mv "$decoded_dir" "$builddir"
+        fi
+    fi
+
+    rm -rf "$builddir-$ARCH-build"
+    cp -rf "$builddir" "$builddir-$ARCH-build"
+    
+    echo "[bzip2] Prepare completed. ARCH=$ARCH" >> "$buildlog"
+}
+
+# ============================================================================
+# build()
+# ============================================================================
+build() {
+    cd "$builddir-$ARCH-build" || return 1
+    
+    local target="aarch64-linux-ohos"
+    local clang="${OHOS_SDK}/native/llvm/bin/clang --target=$target --sysroot=$OHOS_SDK/native/sysroot"
+    local ar="${OHOS_SDK}/native/llvm/bin/llvm-ar"
+    local ranlib="${OHOS_SDK}/native/llvm/bin/llvm-ranlib"
+    
+    local custom_cflags="-fPIC -O2 -D_FILE_OFFSET_BITS=64"
+    
+    echo "[bzip2] Building static library and tools..." >> "$buildlog"
+    
+    make -j$(nproc) \
+        CC="$clang" \
+        AR="$ar" \
+        RANLIB="$ranlib" \
+        CFLAGS="$custom_cflags" \
+        libbz2.a bzip2 bzip2recover >> "$buildlog" 2>&1
+    
+    local ret=$?
+    if [ $ret -ne 0 ]; then
+        echo "[bzip2] ERROR: Static build failed" >> "$buildlog"
+        return $ret
+    fi
+
+    echo "[bzip2] Building shared library..." >> "$buildlog"
+    make -f Makefile-libbz2_so \
+        CC="$clang" \
+        CFLAGS="$custom_cflags" >> "$buildlog" 2>&1
+        
+    ret=$?
+    cd "$OLDPWD"
+    return $ret
+}
+
+# ============================================================================
+# package()
+# ============================================================================
+package() {
+    local build_path="$builddir-$ARCH-build"
+    local install_dir="${LYCIUM_ROOT}/usr/${pkgname}/${ARCH}"
+    
+    echo "[bzip2] Installing to $install_dir..." >> "$buildlog"
+    cd "$build_path" || return 1
+    
+    make install PREFIX="$install_dir" >> "$buildlog" 2>&1
+    
+    # 手动安装动态库
+    cp -d libbz2.so* "$install_dir/lib/"
+    
+    if [ ! -f "$install_dir/lib/libbz2.so" ]; then
+        ln -sf "libbz2.so.${pkgver}" "$install_dir/lib/libbz2.so"
+    fi
+    
+    cd "$OLDPWD"
+    return 0
+}
+
+# ============================================================================
+# check() & cleanbuild()
+# ============================================================================
+check() {
+    echo "Check skipped for cross-compilation"
+    return 0
+}
+
+cleanbuild() {
+    rm -rf "$builddir" "$builddir-arm64-v8a-build"
+}

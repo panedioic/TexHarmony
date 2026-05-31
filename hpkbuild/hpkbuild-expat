@@ -1,0 +1,184 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# expat HPKBUILD - 为鸿蒙交叉编译适配 (同时产出动态库和静态库)
+# -----------------------------------------------------------------------------
+pkgname=expat
+pkgver=2.6.2
+pkgdesc="Fast streaming XML parser written in C"
+url="https://github.com/libexpat/libexpat"
+archs=("arm64-v8a")
+license=("MIT")
+depends=()
+makedepends=("cmake" "ninja")
+
+source="https://github.com/libexpat/libexpat/releases/download/R_${pkgver//./_}/expat-${pkgver}.tar.gz"
+autounpack=true
+downloadpackage=true
+buildtools="cmake"
+
+builddir=expat-${pkgver}
+packagename=expat-${pkgver}.tar.gz
+
+# -----------------------------------------------------------------------------
+# prepare()
+# -----------------------------------------------------------------------------
+prepare() {
+    echo "[expat] Preparing source..."
+    
+    if [ ! -d "$builddir" ]; then
+        local decoded_dir=$(ls -d expat* 2>/dev/null | grep -v "\.tar" | head -n 1)
+        [ -n "$decoded_dir" ] && mv "$decoded_dir" "$builddir"
+    fi
+    
+    # 同时创建动态库和静态库的构建目录
+    mkdir -p "$builddir/build-shared-$ARCH"
+    mkdir -p "$builddir/build-static-$ARCH"
+    echo "[expat] Prepare completed. ARCH=$ARCH" >> "$buildlog"
+}
+
+# -----------------------------------------------------------------------------
+# 共用 cmake 参数
+# -----------------------------------------------------------------------------
+_cmake_common_args() {
+    echo \
+        "-G" "Ninja" \
+        "-DCMAKE_TOOLCHAIN_FILE=$OHOS_SDK/native/build/cmake/ohos.toolchain.cmake" \
+        "-DOHOS_ARCH=$ARCH" \
+        "-DOHOS_PLATFORM=OHOS" \
+        "-DOHOS_STL=c++_shared" \
+        "-DCMAKE_BUILD_TYPE=Release" \
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON" \
+        "-DEXPAT_BUILD_TESTS=OFF" \
+        "-DEXPAT_BUILD_TOOLS=OFF" \
+        "-DEXPAT_BUILD_EXAMPLES=OFF" \
+        "-DEXPAT_BUILD_DOCS=OFF"
+}
+
+# ============================================================================
+# build()
+# ============================================================================
+build() {
+    local install_dir="${LYCIUM_ROOT}/usr/${pkgname}/${ARCH}"
+    local common_args=$(_cmake_common_args)
+    
+    mkdir -p "$install_dir"
+    
+    # ------- 第一轮：动态库 -------
+    echo "[expat] Building SHARED library..." | tee -a "$buildlog"
+    cd "$builddir/build-shared-$ARCH" || return 1
+    
+    cmake .. $common_args \
+        -DBUILD_SHARED_LIBS=ON \
+        -DCMAKE_INSTALL_PREFIX="$install_dir" \
+        >> "$buildlog" 2>&1
+    
+    if [ $? -ne 0 ]; then
+        echo "[expat] ERROR: SHARED CMake config failed" >> "$buildlog"
+        return 1
+    fi
+    
+    ninja -j$(nproc) >> "$buildlog" 2>&1
+    if [ $? -ne 0 ]; then
+        echo "[expat] ERROR: SHARED build failed" >> "$buildlog"
+        return 1
+    fi
+    
+    cd "$OLDPWD"
+    
+    # ------- 第二轮：静态库 -------
+    echo "[expat] Building STATIC library..." | tee -a "$buildlog"
+    cd "$builddir/build-static-$ARCH" || return 1
+    
+    cmake .. $common_args \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_INSTALL_PREFIX="$install_dir" \
+        >> "$buildlog" 2>&1
+    
+    if [ $? -ne 0 ]; then
+        echo "[expat] ERROR: STATIC CMake config failed" >> "$buildlog"
+        return 1
+    fi
+    
+    ninja -j$(nproc) >> "$buildlog" 2>&1
+    if [ $? -ne 0 ]; then
+        echo "[expat] ERROR: STATIC build failed" >> "$buildlog"
+        return 1
+    fi
+    
+    cd "$OLDPWD"
+    return 0
+}
+
+# ============================================================================
+# package()
+# ============================================================================
+package() {
+    local install_dir="${LYCIUM_ROOT}/usr/${pkgname}/${ARCH}"
+    
+    # 1. 通过动态库目录的 ninja install 安装动态库 + 头文件 + pkgconfig
+    echo "[expat] Installing SHARED library and headers..." >> "$buildlog"
+    cd "$builddir/build-shared-$ARCH" || return 1
+    ninja install >> "$buildlog" 2>&1
+    local ret=$?
+    cd "$OLDPWD"
+    if [ $ret -ne 0 ]; then
+        echo "[expat] ERROR: SHARED install failed" >> "$buildlog"
+        return $ret
+    fi
+    
+    # 2. 拷贝静态库到安装目录
+    # expat 的静态库通常命名为 libexpat.a 或 libexpatd.a (Debug 版本带 d)
+    local static_lib=""
+    for candidate in "$builddir/build-static-$ARCH/libexpat.a" \
+                     "$builddir/build-static-$ARCH/libexpatd.a"; do
+        if [ -f "$candidate" ]; then
+            static_lib="$candidate"
+            break
+        fi
+    done
+    
+    if [ -n "$static_lib" ]; then
+        cp "$static_lib" "$install_dir/lib/libexpat.a"
+        echo "[expat] Static library installed at $install_dir/lib/libexpat.a" >> "$buildlog"
+    else
+        echo "[expat] WARNING: libexpat.a not found in static build dir!" >> "$buildlog"
+        # 容错：用 find 兜底
+        find "$builddir/build-static-$ARCH" -name "libexpat*.a" 2>/dev/null | while read libfile; do
+            cp "$libfile" "$install_dir/lib/libexpat.a"
+            echo "[expat] Fallback: copied $libfile" >> "$buildlog"
+        done
+    fi
+    
+    # 3. 验证产物
+    if [ ! -f "$install_dir/lib/libexpat.so" ]; then
+        echo "[expat] ERROR: libexpat.so missing!" >> "$buildlog"
+        return 1
+    fi
+    
+    if [ ! -f "$install_dir/lib/libexpat.a" ]; then
+        echo "[expat] ERROR: libexpat.a missing!" >> "$buildlog"
+        return 1
+    fi
+    
+    if [ ! -f "$install_dir/include/expat.h" ]; then
+        echo "[expat] WARNING: expat.h may be missing" >> "$buildlog"
+    fi
+    
+    echo "[expat] Installation completed (both shared and static)." >> "$buildlog"
+    return 0
+}
+
+# ============================================================================
+# check()
+# ============================================================================
+check() {
+    echo "[expat] Check skipped for cross-compilation"
+    return 0
+}
+
+# ============================================================================
+# cleanbuild()
+# ============================================================================
+cleanbuild() {
+    rm -rf "$builddir"
+}

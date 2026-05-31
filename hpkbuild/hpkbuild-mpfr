@@ -1,0 +1,156 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# mpfr HPKBUILD - 为鸿蒙交叉编译适配 (TexLive 依赖项)
+# -----------------------------------------------------------------------------
+pkgname=mpfr
+pkgver=4.2.1
+pkgdesc="Multiple Precision Floating-Point Reliable Library"
+url="https://www.mpfr.org/"
+archs=("arm64-v8a")
+license=("LGPL-3.0-or-later")
+
+# MPFR 强依赖 GMP，请先编译 gmp
+depends=("gmp")
+makedepends=("make")
+
+# 使用 GNU 官方源（如不通可换 https://www.mpfr.org/mpfr-current/mpfr-${pkgver}.tar.gz）
+source="https://ftp.gnu.org/gnu/mpfr/mpfr-${pkgver}.tar.gz"
+autounpack=true
+downloadpackage=true
+buildtools="configure"
+
+builddir=mpfr-${pkgver}
+packagename=mpfr-${pkgver}.tar.gz
+
+# -----------------------------------------------------------------------------
+# prepare()
+# -----------------------------------------------------------------------------
+prepare() {
+    echo "[mpfr] Preparing source..."
+    
+    if [ ! -d "$builddir" ]; then
+        local decoded_dir=$(ls -d mpfr* 2>/dev/null | grep -v "\.tar" | head -n 1)
+        [ -n "$decoded_dir" ] && mv "$decoded_dir" "$builddir"
+    fi
+    
+    # patch config.sub 让它识别 ohos
+    for config_sub in "$builddir/config.sub" "$builddir/build-aux/config.sub"; do
+        if [ -f "$config_sub" ] && ! grep -q "ohos" "$config_sub"; then
+            echo "[mpfr] Patching $config_sub to recognize 'ohos'..."
+            sed -i 's/-musl\*/-musl* | -ohos*/g' "$config_sub"
+            chmod +x "$config_sub"
+        fi
+    done
+    
+    mkdir -p "$builddir/build-$ARCH"
+    echo "[mpfr] Prepare completed. ARCH=$ARCH" >> "$buildlog"
+}
+
+# ============================================================================
+# build()
+# ============================================================================
+build() {
+    local build_dir="$builddir/build-$ARCH"
+    local install_dir="${LYCIUM_ROOT}/usr/${pkgname}/${ARCH}"
+    local gmp_dir="${LYCIUM_ROOT}/usr/gmp/${ARCH}"
+    
+    # 校验 GMP 是否已编译
+    if [ ! -f "$gmp_dir/lib/libgmp.a" ] && [ ! -f "$gmp_dir/lib/libgmp.so" ]; then
+        echo "[mpfr] ERROR: GMP not found at $gmp_dir/lib/" >> "$buildlog"
+        echo "[mpfr] Please build GMP first." >> "$buildlog"
+        return 1
+    fi
+    
+    if [ ! -f "$gmp_dir/include/gmp.h" ]; then
+        echo "[mpfr] ERROR: gmp.h not found at $gmp_dir/include/" >> "$buildlog"
+        return 1
+    fi
+    
+    echo "[mpfr] Building for $ARCH..." | tee -a "$buildlog"
+    mkdir -p "$install_dir"
+    cd "$build_dir" || return 1
+    
+    local target="aarch64-linux-ohos"
+    local sysroot="$OHOS_SDK/native/sysroot"
+    
+    export CC="$OHOS_SDK/native/llvm/bin/clang --target=$target --sysroot=$sysroot"
+    export CXX="$OHOS_SDK/native/llvm/bin/clang++ --target=$target --sysroot=$sysroot"
+    export AR="$OHOS_SDK/native/llvm/bin/llvm-ar"
+    export RANLIB="$OHOS_SDK/native/llvm/bin/llvm-ranlib"
+    export STRIP="$OHOS_SDK/native/llvm/bin/llvm-strip"
+    export CFLAGS="-fPIC -O2"
+    export CXXFLAGS="-fPIC -O2"
+    export LDFLAGS="--target=$target --sysroot=$sysroot"
+    
+    # 关键修复：只用 --with-gmp，不能与 --with-gmp-include/--with-gmp-lib 同时使用
+    ../configure \
+        --host=aarch64-linux-gnu \
+        --prefix="$install_dir" \
+        --with-gmp="$gmp_dir" \
+        --enable-shared \
+        --enable-static \
+        --disable-decimal-float \
+        >> "$buildlog" 2>&1
+    
+    local ret=$?
+    if [ $ret -ne 0 ]; then
+        echo "[mpfr] ERROR: configure failed" >> "$buildlog"
+        cat config.log >> "$buildlog" 2>&1
+        cd "$OLDPWD"
+        unset CC CXX AR RANLIB STRIP CFLAGS CXXFLAGS LDFLAGS
+        return $ret
+    fi
+    
+    make -j$(nproc) >> "$buildlog" 2>&1
+    ret=$?
+    
+    cd "$OLDPWD"
+    unset CC CXX AR RANLIB STRIP CFLAGS CXXFLAGS LDFLAGS
+    return $ret
+}
+
+# ============================================================================
+# package()
+# ============================================================================
+package() {
+    local build_dir="$builddir/build-$ARCH"
+    local install_dir="${LYCIUM_ROOT}/usr/${pkgname}/${ARCH}"
+    
+    echo "[mpfr] Installing to $install_dir..." >> "$buildlog"
+    cd "$build_dir" || return 1
+    
+    make install >> "$buildlog" 2>&1
+    local ret=$?
+    
+    cd "$OLDPWD"
+    
+    # 验证关键产物
+    if [ ! -f "$install_dir/lib/libmpfr.so" ] && \
+       [ ! -f "$install_dir/lib/libmpfr.a" ]; then
+        echo "[mpfr] ERROR: libmpfr not installed!" >> "$buildlog"
+        return 1
+    fi
+    
+    if [ ! -f "$install_dir/include/mpfr.h" ]; then
+        echo "[mpfr] ERROR: mpfr.h not found!" >> "$buildlog"
+        return 1
+    fi
+    
+    echo "[mpfr] Installation completed." >> "$buildlog"
+    return $ret
+}
+
+# ============================================================================
+# check()
+# ============================================================================
+check() {
+    echo "[mpfr] Check skipped for cross-compilation (tests require running aarch64 binaries)"
+    return 0
+}
+
+# ============================================================================
+# cleanbuild()
+# ============================================================================
+cleanbuild() {
+    rm -rf "$builddir"
+}

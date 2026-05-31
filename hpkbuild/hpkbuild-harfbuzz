@@ -1,0 +1,217 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# harfbuzz HPKBUILD - 为鸿蒙交叉编译适配 (TexLive 依赖项)
+# -----------------------------------------------------------------------------
+pkgname=harfbuzz
+pkgver=7.1.0
+pkgdesc="HarfBuzz is a text shaping engine."
+url="https://github.com/harfbuzz/harfbuzz"
+archs=("arm64-v8a")
+license=("MIT" "OFL-1.1" "Apache-2.0")
+
+depends=("freetype2" "graphite2")
+makedepends=("cmake" "ninja")
+
+source="https://gitee.com/lycium_pkg_mirror/harfbuzz/repository/archive/${pkgver}.zip"
+autounpack=true
+downloadpackage=true
+buildtools="cmake"
+
+builddir=harfbuzz-${pkgver}
+packagename=harfbuzz-${pkgver}.zip
+
+# -----------------------------------------------------------------------------
+# prepare()
+# -----------------------------------------------------------------------------
+prepare() {
+    echo "[harfbuzz] Preparing source..."
+    
+    if [ ! -d "$builddir" ]; then
+        local decoded_dir=$(ls -d harfbuzz* 2>/dev/null | grep -v "\.zip" | head -n 1)
+        [ -n "$decoded_dir" ] && mv "$decoded_dir" "$builddir"
+    fi
+
+    # 同时创建动态库和静态库的构建目录
+    mkdir -p "$builddir/build-shared-$ARCH"
+    mkdir -p "$builddir/build-static-$ARCH"
+    echo "[harfbuzz] Prepare completed. ARCH=$ARCH" >> "$buildlog"
+}
+
+# -----------------------------------------------------------------------------
+# 提取共用的 cmake 参数到一个函数中，避免重复写
+# -----------------------------------------------------------------------------
+_cmake_common_args() {
+    local freetype_dir="${LYCIUM_ROOT}/usr/freetype2/${ARCH}"
+    local graphite2_dir="${LYCIUM_ROOT}/usr/graphite2/${ARCH}"
+    
+    echo \
+        "-G" "Ninja" \
+        "-DCMAKE_TOOLCHAIN_FILE=$OHOS_SDK/native/build/cmake/ohos.toolchain.cmake" \
+        "-DOHOS_ARCH=$ARCH" \
+        "-DOHOS_PLATFORM=OHOS" \
+        "-DOHOS_STL=c++_shared" \
+        "-DCMAKE_BUILD_TYPE=Release" \
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON" \
+        "-DHB_HAVE_FREETYPE=ON" \
+        "-DHB_HAVE_ICU=OFF" \
+        "-DHB_HAVE_GLIB=OFF" \
+        "-DHB_HAVE_GOBJECT=OFF" \
+        "-DHB_HAVE_CAIRO=OFF" \
+        \
+        "-DHB_HAVE_GRAPHITE2=ON" \
+        "-DGRAPHITE2_INCLUDE_DIR=$graphite2_dir/include" \
+        "-DGRAPHITE2_LIBRARY=$graphite2_dir/lib/libgraphite2.a" \
+        \
+        "-DHB_BUILD_TESTS=OFF" \
+        "-DHB_BUILD_UTILS=OFF" \
+        "-DFREETYPE_INCLUDE_DIRS=$freetype_dir/include/freetype2" \
+        "-DFREETYPE_LIBRARY=$freetype_dir/lib/libfreetype.a"
+}
+
+# ============================================================================
+# build() - 一次性完成动态库 + 静态库编译
+# ============================================================================
+build() {
+    local install_dir="${LYCIUM_ROOT}/usr/${pkgname}/${ARCH}"
+    local freetype_dir="${LYCIUM_ROOT}/usr/freetype2/${ARCH}"
+    local zlib_dir="${LYCIUM_ROOT}/usr/zlib/${ARCH}"
+    local libpng_dir="${LYCIUM_ROOT}/usr/libpng/${ARCH}"
+    local bzip2_dir="${LYCIUM_ROOT}/usr/bzip2/${ARCH}"
+    local brotli_dir="${LYCIUM_ROOT}/usr/brotli/${ARCH}"
+    local graphite2_dir="${LYCIUM_ROOT}/usr/graphite2/${ARCH}"
+    
+    # 校验前置依赖
+    if [ ! -f "$freetype_dir/lib/libfreetype.a" ]; then
+        echo "[harfbuzz] ERROR: libfreetype.a not found." >> "$buildlog"
+        return 1
+    fi
+    
+    # 拼接 freetype 间接依赖的链接参数
+    # 因为 libfreetype.a 编译时启用了 zlib/bzip2/brotli/libpng 支持
+    # 必须把这些库一并链接进来，否则会报 undefined symbol
+    local extra_libs=""
+    [ -f "$zlib_dir/lib/libz.a" ]      && extra_libs="$extra_libs $zlib_dir/lib/libz.a"
+    [ -f "$libpng_dir/lib/libpng.a" ]  && extra_libs="$extra_libs $libpng_dir/lib/libpng.a"
+    [ -f "$libpng_dir/lib/libpng16.a" ] && extra_libs="$extra_libs $libpng_dir/lib/libpng16.a"
+    [ -f "$bzip2_dir/lib/libbz2.a" ]   && extra_libs="$extra_libs $bzip2_dir/lib/libbz2.a"
+    [ -f "$brotli_dir/lib/libbrotlidec.a" ] && extra_libs="$extra_libs $brotli_dir/lib/libbrotlidec.a"
+    [ -f "$brotli_dir/lib/libbrotlicommon.a" ] && extra_libs="$extra_libs $brotli_dir/lib/libbrotlicommon.a"
+    
+    # 如果某些依赖只有 .so 而没有 .a，则用 .so
+    [ -z "$(echo $extra_libs | grep libz)" ] && [ -f "$zlib_dir/lib/libz.so" ] && extra_libs="$extra_libs $zlib_dir/lib/libz.so"
+    [ -z "$(echo $extra_libs | grep libpng)" ] && [ -f "$libpng_dir/lib/libpng.so" ] && extra_libs="$extra_libs $libpng_dir/lib/libpng.so"
+    [ -z "$(echo $extra_libs | grep libbz2)" ] && [ -f "$bzip2_dir/lib/libbz2.so" ] && extra_libs="$extra_libs $bzip2_dir/lib/libbz2.so"
+    
+    # 加入 graphite2 静态库
+    extra_libs="$extra_libs $graphite2_dir/lib/libgraphite2.a"
+    
+    # 因为 graphite2 是 C++ 库，被链接进 harfbuzz.so 时需要满足 C++ 符号引用
+    extra_libs="$extra_libs -lc++_shared"
+
+    echo "[harfbuzz] Extra link libraries: $extra_libs" >> "$buildlog"
+    
+    local common_args=$(_cmake_common_args)
+    
+    mkdir -p "$install_dir"
+    
+    # ------- 第一轮：编译动态库 -------
+    echo "[harfbuzz] Building SHARED library..." | tee -a "$buildlog"
+    cd "$builddir/build-shared-$ARCH" || return 1
+    
+    cmake .. $common_args \
+        -DBUILD_SHARED_LIBS=ON \
+        -DCMAKE_INSTALL_PREFIX="$install_dir" \
+        -DCMAKE_SHARED_LINKER_FLAGS="$extra_libs" \
+        -DCMAKE_EXE_LINKER_FLAGS="$extra_libs" \
+        >> "$buildlog" 2>&1
+    
+    if [ $? -ne 0 ]; then
+        echo "[harfbuzz] ERROR: SHARED CMake config failed" >> "$buildlog"
+        return 1
+    fi
+    
+    ninja -j$(nproc) >> "$buildlog" 2>&1
+    if [ $? -ne 0 ]; then
+        echo "[harfbuzz] ERROR: SHARED build failed" >> "$buildlog"
+        return 1
+    fi
+    
+    cd "$OLDPWD"
+    
+    # ------- 第二轮：编译静态库 -------
+    # 静态库本身不需要链接依赖，但保留 extra_libs 参数无害
+    echo "[harfbuzz] Building STATIC library..." | tee -a "$buildlog"
+    cd "$builddir/build-static-$ARCH" || return 1
+    
+    cmake .. $common_args \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_INSTALL_PREFIX="$install_dir" \
+        >> "$buildlog" 2>&1
+    
+    if [ $? -ne 0 ]; then
+        echo "[harfbuzz] ERROR: STATIC CMake config failed" >> "$buildlog"
+        return 1
+    fi
+    
+    ninja -j$(nproc) >> "$buildlog" 2>&1
+    if [ $? -ne 0 ]; then
+        echo "[harfbuzz] ERROR: STATIC build failed" >> "$buildlog"
+        return 1
+    fi
+    
+    cd "$OLDPWD"
+    return 0
+}
+
+# ============================================================================
+# package() - 仅做安装与拷贝
+# ============================================================================
+package() {
+    local install_dir="${LYCIUM_ROOT}/usr/${pkgname}/${ARCH}"
+    
+    # 1. 通过 ninja install 安装动态库版本（包含头文件、pkgconfig 等）
+    echo "[harfbuzz] Installing SHARED library and headers..." >> "$buildlog"
+    cd "$builddir/build-shared-$ARCH" || return 1
+    ninja install >> "$buildlog" 2>&1
+    local ret=$?
+    cd "$OLDPWD"
+    if [ $ret -ne 0 ]; then return $ret; fi
+    
+    # 2. 拷贝静态库
+    local static_lib="$builddir/build-static-$ARCH/libharfbuzz.a"
+    if [ -f "$static_lib" ]; then
+        cp "$static_lib" "$install_dir/lib/"
+        echo "[harfbuzz] Static library installed at $install_dir/lib/libharfbuzz.a" >> "$buildlog"
+    else
+        echo "[harfbuzz] WARNING: libharfbuzz.a not found!" >> "$buildlog"
+    fi
+    
+    # 3. 验证产物
+    if [ ! -f "$install_dir/lib/libharfbuzz.so" ]; then
+        echo "[harfbuzz] ERROR: libharfbuzz.so missing!" >> "$buildlog"
+        return 1
+    fi
+    
+    # 特别校验：确认 hb-graphite2.h 是否存在
+    if [ ! -f "$install_dir/include/harfbuzz/hb-graphite2.h" ]; then
+        echo "[harfbuzz] ERROR: hb-graphite2.h was not generated! TexLive will fail." >> "$buildlog"
+        return 1
+    fi
+    
+    return 0
+}
+
+# ============================================================================
+# check()
+# ============================================================================
+check() {
+    echo "[harfbuzz] Check skipped for cross-compilation"
+    return 0
+}
+
+# ============================================================================
+# cleanbuild()
+# ============================================================================
+cleanbuild() {
+    rm -rf "$builddir"
+}

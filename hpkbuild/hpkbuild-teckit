@@ -1,0 +1,174 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# teckit HPKBUILD - 为鸿蒙交叉编译适配 (TexLive 依赖项)
+# -----------------------------------------------------------------------------
+pkgname=teckit
+pkgver=2.5.12
+pkgdesc="TECkit is a low-level toolkit for performing encoding conversions"
+url="https://github.com/silnrsi/teckit"
+archs=("arm64-v8a")
+license=("LGPL-2.1-or-later")
+depends=("zlib")
+makedepends=("make" "perl")
+
+source="https://github.com/silnrsi/teckit/releases/download/v${pkgver}/teckit-${pkgver}.tar.gz"
+autounpack=true
+downloadpackage=true
+buildtools="configure"
+
+builddir=teckit-${pkgver}
+packagename=teckit-${pkgver}.tar.gz
+
+# -----------------------------------------------------------------------------
+# prepare()
+# -----------------------------------------------------------------------------
+prepare() {
+    echo "[teckit] Preparing source..."
+    
+    if [ ! -d "$builddir" ]; then
+        local decoded_dir=$(ls -d teckit* 2>/dev/null | grep -v "\.tar\.gz" | head -n 1)
+        [ -n "$decoded_dir" ] && mv "$decoded_dir" "$builddir"
+    fi
+    
+    # patch config.sub 让它识别 ohos（备用方案，主方案是用 --host=aarch64-linux-gnu）
+    for config_sub in "$builddir/build-aux/config.sub" "$builddir/config.sub"; do
+        if [ -f "$config_sub" ] && ! grep -q "ohos" "$config_sub"; then
+            echo "[teckit] Patching $config_sub to recognize 'ohos'..."
+            sed -i 's/-musl\*/-musl* | -ohos*/g' "$config_sub"
+            chmod +x "$config_sub"
+        fi
+    done
+    
+    mkdir -p "$builddir/build-$ARCH"
+    echo "[teckit] Prepare completed. ARCH=$ARCH" >> "$buildlog"
+}
+
+# ============================================================================
+# build()
+# ============================================================================
+build() {
+    local build_dir="$builddir/build-$ARCH"
+    local install_dir="${LYCIUM_ROOT}/usr/${pkgname}/${ARCH}"
+    local zlib_dir="${LYCIUM_ROOT}/usr/zlib/${ARCH}"
+    
+    if [ ! -f "$zlib_dir/lib/libz.a" ] && [ ! -f "$zlib_dir/lib/libz.so" ]; then
+        echo "[teckit] ERROR: zlib not found at $zlib_dir/lib/" >> "$buildlog"
+        return 1
+    fi
+    
+    echo "[teckit] Building for $ARCH..." | tee -a "$buildlog"
+    mkdir -p "$install_dir"
+    cd "$build_dir" || return 1
+    
+    local target="aarch64-linux-ohos"
+    local sysroot="$OHOS_SDK/native/sysroot"
+    
+    export CC="$OHOS_SDK/native/llvm/bin/clang --target=$target --sysroot=$sysroot"
+    export CXX="$OHOS_SDK/native/llvm/bin/clang++ --target=$target --sysroot=$sysroot"
+    export AR="$OHOS_SDK/native/llvm/bin/llvm-ar"
+    export RANLIB="$OHOS_SDK/native/llvm/bin/llvm-ranlib"
+    export STRIP="$OHOS_SDK/native/llvm/bin/llvm-strip"
+    export CFLAGS="-fPIC -O2 -I$zlib_dir/include"
+    export CXXFLAGS="-fPIC -O2 -I$zlib_dir/include"
+    export LDFLAGS="--target=$target --sysroot=$sysroot -L$zlib_dir/lib"
+    export LIBS="-lz"
+    
+    ../configure \
+        --host=aarch64-linux-gnu \
+        --prefix="$install_dir" \
+        --enable-shared \
+        --enable-static \
+        >> "$buildlog" 2>&1
+    
+    local ret=$?
+    if [ $ret -ne 0 ]; then
+        echo "[teckit] ERROR: configure failed" >> "$buildlog"
+        cat config.log >> "$buildlog" 2>&1
+        return $ret
+    fi
+    
+    # 关键改动：只编译 lib 目录（库文件），跳过 bin (命令行工具)
+    # bin 目录依赖 expat 内嵌源码，但其 include path 在交叉编译时配置错误
+    # TexLive 只需要库文件，所以这些工具完全可以跳过
+    echo "[teckit] Compiling lib/ only (skipping bin/ tools)..." >> "$buildlog"
+    make -j$(nproc) -C lib >> "$buildlog" 2>&1
+    ret=$?
+    
+    if [ $ret -ne 0 ]; then
+        echo "[teckit] ERROR: lib build failed" >> "$buildlog"
+        cd "$OLDPWD"
+        unset CC CXX AR RANLIB STRIP CFLAGS CXXFLAGS LDFLAGS LIBS
+        return $ret
+    fi
+    
+    cd "$OLDPWD"
+    unset CC CXX AR RANLIB STRIP CFLAGS CXXFLAGS LDFLAGS LIBS
+    return 0
+}
+
+# ============================================================================
+# package()
+# ============================================================================
+package() {
+    local build_dir="$builddir/build-$ARCH"
+    local install_dir="${LYCIUM_ROOT}/usr/${pkgname}/${ARCH}"
+    
+    echo "[teckit] Installing to $install_dir..." >> "$buildlog"
+    cd "$build_dir" || return 1
+    
+    # 只 install lib 目录，跳过 bin 工具
+    make -C lib install >> "$buildlog" 2>&1
+    local ret=$?
+    
+    cd "$OLDPWD"
+    
+    # 手动安装头文件（lib 的 Makefile 可能不会安装公共头文件）
+    if [ ! -f "$install_dir/include/teckit/TECkit_Common.h" ]; then
+        echo "[teckit] Installing headers manually..." >> "$buildlog"
+        mkdir -p "$install_dir/include/teckit"
+        # TecKit 的公共头文件在 source/Public-headers 目录
+        if [ -d "$builddir/source/Public-headers" ]; then
+            cp "$builddir/source/Public-headers"/*.h "$install_dir/include/teckit/" 2>/dev/null
+        fi
+        # 备用路径
+        find "$builddir/source" -name "TECkit_*.h" 2>/dev/null | while read header; do
+            cp -n "$header" "$install_dir/include/teckit/" 2>/dev/null
+        done
+    fi
+    
+    # 安装 pkgconfig 文件
+    if [ -f "$build_dir/teckit.pc" ] && [ ! -f "$install_dir/lib/pkgconfig/teckit.pc" ]; then
+        mkdir -p "$install_dir/lib/pkgconfig"
+        cp "$build_dir/teckit.pc" "$install_dir/lib/pkgconfig/"
+    fi
+    
+    # 验证产物
+    if [ ! -f "$install_dir/lib/libTECkit.so" ] && \
+       [ ! -f "$install_dir/lib/libTECkit.a" ]; then
+        echo "[teckit] ERROR: No TECkit libraries installed!" >> "$buildlog"
+        return 1
+    fi
+    
+    if [ ! -f "$install_dir/include/teckit/TECkit_Common.h" ] && \
+       [ ! -f "$install_dir/include/teckit/TECkit_Engine.h" ]; then
+        echo "[teckit] WARNING: Headers may not be properly installed" >> "$buildlog"
+    fi
+    
+    echo "[teckit] Installation completed." >> "$buildlog"
+    return 0
+}
+
+# ============================================================================
+# check()
+# ============================================================================
+check() {
+    echo "[teckit] Check skipped for cross-compilation"
+    return 0
+}
+
+# ============================================================================
+# cleanbuild()
+# ============================================================================
+cleanbuild() {
+    rm -rf "$builddir"
+}
