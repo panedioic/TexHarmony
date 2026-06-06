@@ -64,7 +64,8 @@ export LD="${TOOLCHAIN_BIN}/ld.lld"
 
 export CFLAGS="-O2 -fPIC ${DEP_INCLUDES}"
 export CXXFLAGS="-O2 -fPIC ${DEP_INCLUDES}"
-export LDFLAGS="${DEP_LIBDIRS}"
+# 为了保证bin目录里面的二进制执行过程中能自动加载lib下的库文件，则需要在编译二进制时增加以下rpath链接选项，指明库文件和二进制的相对位置关系（${ORIGIN}为当前二进制位置）。
+export LDFLAGS="${DEP_LIBDIRS} -Wl,-rpath='\$\$ORIGIN/../lib' -Wl,--disable-new-dtags"
 export PKG_CONFIG_PATH="${ICU_PREFIX}/lib/pkgconfig:${FREETYPE_PREFIX}/lib/pkgconfig:${HARFBUZZ_PREFIX}/lib/pkgconfig:${GRAPHITE2_PREFIX}/lib/pkgconfig:${TECKIT_PREFIX}/lib/pkgconfig:${ZLIB_PREFIX}/lib/pkgconfig"
 
 JOBS="${JOBS:-$(nproc)}"
@@ -345,6 +346,26 @@ step_end
 # ============================================================
 step_start "打补丁"
 
+# --- 修复 kpathsea: 处理 OHOS 沙箱对绝对路径 lstat 的 EACCES 限制 ---
+PROGNAME_SRC="${SOURCE_DIR}/texk/kpathsea/progname.c"
+if [ -f "${PROGNAME_SRC}" ]; then
+    if ! grep -q "OHOS Sandbox blocks lstat" "${PROGNAME_SRC}"; then
+        # 使用 sed 进行多行替换
+        # 查找包含 if (lstat (pre, &st) != 0) { 的行，并替换随后的 4 行
+        sed -i '/if (lstat (pre, &st) != 0) {/{
+N
+N
+N
+N
+c\
+    if (lstat (pre, \&st) != 0) {\n      if (errno == EACCES) {\n        // OHOS Sandbox blocks lstat on absolute installation paths. \n        // We assume it'\''s not a symlink and continue.\n        st.st_mode = 0; \n      } else {\n        fprintf (stderr, "lstat(%s) failed: ", pre);\n        perror (pre);\n        return NULL;\n      }\n    }
+}' "${PROGNAME_SRC}"
+        log "已修补: progname.c (OHOS 沙箱 lstat 兼容)"
+    else
+        log "跳过修补: progname.c (OHOS 沙箱 lstat 兼容已存在)"
+    fi
+fi
+
 # --- 修复 dvipdfmx: 鸿蒙没有 getpass() 函数 ---
 DVIPDFMX_SRC="${SOURCE_DIR}/texk/dvipdfm-x/dvipdfmx.c"
 if [ -f "${DVIPDFMX_SRC}" ] && grep -q "getpass" "${DVIPDFMX_SRC}"; then
@@ -474,6 +495,24 @@ if [ -n "${FIRST_BIN}" ]; then
     log "架构验证 (${FIRST_BIN}):"
     file "${DIST_DIR}/bin/${FIRST_BIN}" | sed 's/^/    /'
 fi
+
+# ============================================================
+# 创建缺失的软链接
+# ============================================================
+log "创建常用 TeX 引擎软链接..."
+(
+    cd "${DIST_DIR}/bin"
+    ln -sf pdftex pdflatex
+    ln -sf pdftex latex
+    ln -sf xetex xelatex
+    if [ -f "luajithbtex" ]; then
+        ln -sf luajithbtex lualatex
+    elif [ -f "luahbtex" ]; then
+        ln -sf luahbtex lualatex
+    elif [ -f "luatex" ]; then
+        ln -sf luatex lualatex
+    fi
+)
 
 step_end
 

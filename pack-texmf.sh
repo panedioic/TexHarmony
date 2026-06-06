@@ -421,6 +421,13 @@ TEXINPUTS.tex = .;$TEXMFDIST/tex/{plain,generic}//
 TEXINPUTS.xetex = .;$TEXMFDIST/tex/{plain,generic,latex,xelatex}//
 TEXINPUTS.xelatex = .;$TEXMFDIST/tex/{plain,generic,latex,xelatex}//
 
+% BibTeX 路径
+BIBINPUTS = .;$TEXMFDIST/bibtex/bib//
+BSTINPUTS = .;$TEXMFDIST/bibtex/{bst,csf}//
+
+% MakeIndex 路径
+INDEXSTYLE = .;$TEXMFDIST/makeindex//
+
 % 字体路径
 TFMFONTS = .;$TEXMFDIST/fonts/tfm//
 T1FONTS = .;$TEXMFDIST/fonts/type1//
